@@ -11,6 +11,7 @@
 		53F557F5114EA63600A3DA4B /* SDURLCache.m in Sources */ = {isa = PBXBuildFile; fileRef = 53F557F3114EA63600A3DA4B /* SDURLCache.m */; };
 		53F5592C114F1ED800A3DA4B /* SDURLCacheTests.m in Sources */ = {isa = PBXBuildFile; fileRef = 53F5592B114F1ED800A3DA4B /* SDURLCacheTests.m */; };
 		53F559B7114F2AA600A3DA4B /* libSDURLCache.a in Frameworks */ = {isa = PBXBuildFile; fileRef = D2AAC07E0554694100DB518D /* libSDURLCache.a */; };
+		946BC9B713EC7FE4008C4ED5 /* libsqlite3.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 946BC9B613EC7FE4008C4ED5 /* libsqlite3.dylib */; };
 		AA747D9F0F9514B9006C5449 /* SDURLCache_Prefix.pch in Headers */ = {isa = PBXBuildFile; fileRef = AA747D9E0F9514B9006C5449 /* SDURLCache_Prefix.pch */; };
 /* End PBXBuildFile section */
 
@@ -30,6 +31,7 @@
 		53F5591C114F1D5E00A3DA4B /* SDURLCacheTestBundle.octest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SDURLCacheTestBundle.octest; sourceTree = BUILT_PRODUCTS_DIR; };
 		53F5592A114F1ED800A3DA4B /* SDURLCacheTests.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = SDURLCacheTests.h; sourceTree = "<group>"; };
 		53F5592B114F1ED800A3DA4B /* SDURLCacheTests.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = SDURLCacheTests.m; sourceTree = "<group>"; };
+		946BC9B613EC7FE4008C4ED5 /* libsqlite3.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libsqlite3.dylib; path = usr/lib/libsqlite3.dylib; sourceTree = SDKROOT; };
 		AA747D9E0F9514B9006C5449 /* SDURLCache_Prefix.pch */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = SDURLCache_Prefix.pch; sourceTree = SOURCE_ROOT; };
 		D2AAC07E0554694100DB518D /* libSDURLCache.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libSDURLCache.a; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -40,6 +42,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				53F559B7114F2AA600A3DA4B /* libSDURLCache.a in Frameworks */,
+				946BC9B713EC7FE4008C4ED5 /* libsqlite3.dylib in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -77,6 +80,7 @@
 		0867D69AFE84028FC02AAC07 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				946BC9B613EC7FE4008C4ED5 /* libsqlite3.dylib */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";

@@ -7,14 +7,18 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <sqlite3.h>
+#import <libkern/OSAtomic.h>
 
 @interface SDURLCache : NSURLCache
 {
     @private
     NSString *diskCachePath;
+    sqlite3 *database;
+    volatile OSSpinLock spinLock;
     NSMutableDictionary *diskCacheInfo;
-    BOOL diskCacheInfoDirty, ignoreMemoryOnlyStoragePolicy;
-    NSUInteger diskCacheUsage;
+    BOOL ignoreMemoryOnlyStoragePolicy;
+    sqlite3_int64 diskCacheUsage;
     NSTimeInterval minCacheInterval;
     NSOperationQueue *ioQueue;
     NSTimer *periodicMaintenanceTimer;

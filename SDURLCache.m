@@ -10,7 +10,7 @@
 #import <CommonCrypto/CommonDigest.h>
 
 static NSTimeInterval const kSDURLCacheInfoDefaultMinCacheInterval = 5 * 60; // 5 minute
-static NSString *const kSDURLCacheInfoFileName = @"cacheInfo.plist";
+static NSString *const kSDURLCacheInfoFileName = @"cacheInfo.db";
 static NSString *const kSDURLCacheInfoDiskUsageKey = @"diskUsage";
 static NSString *const kSDURLCacheInfoAccessesKey = @"accesses";
 static NSString *const kSDURLCacheInfoSizesKey = @"sizes";
@@ -49,7 +49,6 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
 @interface SDURLCache ()
 @property (nonatomic, retain) NSString *diskCachePath;
-@property (nonatomic, readonly) NSMutableDictionary *diskCacheInfo;
 @property (nonatomic, retain) NSOperationQueue *ioQueue;
 @property (retain) NSOperation *periodicMaintenanceOperation;
 - (void)periodicMaintenance;
@@ -58,7 +57,6 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 @implementation SDURLCache
 
 @synthesize diskCachePath, minCacheInterval, ioQueue, periodicMaintenanceOperation, ignoreMemoryOnlyStoragePolicy;
-@dynamic diskCacheInfo;
 
 #pragma mark SDURLCache (tools)
 
@@ -74,7 +72,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     return copy;
 }
 
-+ (NSString *)cacheKeyForURL:(NSURL *)url
++ (NSString *)fileNameForURL:(NSURL *)url
 {
     const char *str = [url.absoluteString UTF8String];
     unsigned char r[CC_MD5_DIGEST_LENGTH];
@@ -234,92 +232,39 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
 #pragma mark SDURLCache (private)
 
-- (NSMutableDictionary *)diskCacheInfo
-{
-    if (!diskCacheInfo)
-    {
-        @synchronized(self)
-        {
-            if (!diskCacheInfo) // Check again, maybe another thread created it while waiting for the mutex
-            {
-                diskCacheInfo = [[NSMutableDictionary alloc] initWithContentsOfFile:[diskCachePath stringByAppendingPathComponent:kSDURLCacheInfoFileName]];
-                if (!diskCacheInfo)
-                {
-                    diskCacheInfo = [[NSMutableDictionary alloc] initWithObjectsAndKeys:
-                                     [NSNumber numberWithUnsignedInt:0], kSDURLCacheInfoDiskUsageKey,
-                                     [NSMutableDictionary dictionary], kSDURLCacheInfoAccessesKey,
-                                     [NSMutableDictionary dictionary], kSDURLCacheInfoSizesKey,
-                                     nil];
-                }
-                diskCacheInfoDirty = NO;
-
-                diskCacheUsage = [[diskCacheInfo objectForKey:kSDURLCacheInfoDiskUsageKey] unsignedIntValue];
-
-                periodicMaintenanceTimer = [[NSTimer scheduledTimerWithTimeInterval:5
-                                                                             target:self
-                                                                           selector:@selector(periodicMaintenance)
-                                                                           userInfo:nil
-                                                                            repeats:YES] retain];
-            }
-        }
-    }
-
-    return diskCacheInfo;
-}
-
-- (void)createDiskCachePath
-{
-    NSFileManager *fileManager = [[NSFileManager alloc] init];
-    if (![fileManager fileExistsAtPath:diskCachePath])
-    {
-        [fileManager createDirectoryAtPath:diskCachePath
-               withIntermediateDirectories:YES
-                                attributes:nil
-                                     error:NULL];
-    }
-    [fileManager release];
-}
-
-- (void)saveCacheInfo
-{
-    [self createDiskCachePath];
-    @synchronized(self.diskCacheInfo)
-    {
-        NSData *data = [NSPropertyListSerialization dataFromPropertyList:self.diskCacheInfo format:NSPropertyListBinaryFormat_v1_0 errorDescription:NULL];
-        if (data)
-        {
-            [data writeToFile:[diskCachePath stringByAppendingPathComponent:kSDURLCacheInfoFileName] atomically:YES];
-        }
-
-        diskCacheInfoDirty = NO;
-    }
-}
-
-- (void)removeCachedResponseForCachedKeys:(NSArray *)cacheKeys
+- (void)removeCachedResponseForURLs:(NSArray *)urls
 {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-
-    NSEnumerator *enumerator = [cacheKeys objectEnumerator];
-    NSString *cacheKey;
-
-    @synchronized(self.diskCacheInfo)
-    {
-        NSMutableDictionary *accesses = [self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey];
-        NSMutableDictionary *sizes = [self.diskCacheInfo objectForKey:kSDURLCacheInfoSizesKey];
-        NSFileManager *fileManager = [[[NSFileManager alloc] init] autorelease];
-
-        while ((cacheKey = [enumerator nextObject]))
-        {
-            NSUInteger cacheItemSize = [[sizes objectForKey:cacheKey] unsignedIntegerValue];
-            [accesses removeObjectForKey:cacheKey];
-            [sizes removeObjectForKey:cacheKey];
-            [fileManager removeItemAtPath:[diskCachePath stringByAppendingPathComponent:cacheKey] error:NULL];
-
-            diskCacheUsage -= cacheItemSize;
-            [self.diskCacheInfo setObject:[NSNumber numberWithUnsignedInteger:diskCacheUsage] forKey:kSDURLCacheInfoDiskUsageKey];
+    NSFileManager *fileManager = [[NSFileManager alloc] init];
+    
+    OSSpinLockLock(&spinLock);
+    sqlite3_exec(database, "BEGIN;", NULL, NULL, NULL);
+    for (NSURL *url in urls) {
+        [fileManager removeItemAtPath:[diskCachePath stringByAppendingPathComponent:[SDURLCache fileNameForURL:url]] error:NULL];
+        sqlite3_stmt *stmt = NULL;
+        const char *urlString = [[url absoluteString] UTF8String];
+        size_t length = strlen(urlString);
+        sqlite_int64 size = 0;
+        if (sqlite3_prepare_v2(database, "SELECT size FROM cacheEntries WHERE url = ?;", -1, &stmt, NULL)) {
+            sqlite3_bind_text(stmt, 1, urlString, length, SQLITE_TRANSIENT);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                size += sqlite3_column_int64(stmt, 0);
+            }
+            sqlite3_finalize(stmt);
+        }
+        if (sqlite3_prepare_v2(database, "UPDATE diskUsage SET totalSize = totalSize - ?;DELETE FROM cacheEntries WHERE url = ?;", -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, size);
+            sqlite3_bind_text(stmt, 2, urlString, length, SQLITE_TRANSIENT);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+            }
+            sqlite3_finalize(stmt);
+            diskCacheUsage -= size;
         }
     }
+    sqlite3_exec(database, "COMMIT;", NULL, NULL, NULL);
+    OSSpinLockUnlock(&spinLock);
 
+    [fileManager release];
     [pool drain];
 }
 
@@ -331,27 +276,26 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         return;
     }
 
-    NSMutableArray *keysToRemove = [NSMutableArray array];
+    NSMutableArray *urlsToRemove = [NSMutableArray array];
 
-    @synchronized(self.diskCacheInfo)
-    {
-        // Apply LRU cache eviction algorithm while disk usage outreach capacity
-        NSDictionary *sizes = [self.diskCacheInfo objectForKey:kSDURLCacheInfoSizesKey];
-
-        NSInteger capacityToSave = diskCacheUsage - self.diskCapacity;
-        NSArray *sortedKeys = [[self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey] keysSortedByValueUsingSelector:@selector(compare:)];
-        NSEnumerator *enumerator = [sortedKeys objectEnumerator];
-        NSString *cacheKey;
-
-        while (capacityToSave > 0 && (cacheKey = [enumerator nextObject]))
-        {
-            [keysToRemove addObject:cacheKey];
-            capacityToSave -= [(NSNumber *)[sizes objectForKey:cacheKey] unsignedIntegerValue];
+    OSSpinLockLock(&spinLock);
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_int64 capacityToSave = diskCacheUsage - self.diskCapacity;
+    if (sqlite3_prepare_v2(database, "SELECT url, size FROM cacheEntries ORDER BY accessData;", -1, &stmt, NULL) != SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const void *urlString = sqlite3_column_text(stmt, 0);
+            if (urlString) {
+                [urlsToRemove addObject:[NSURL URLWithString:[NSString stringWithUTF8String:urlString]]];
+                capacityToSave -= sqlite3_column_int64(stmt, 1);
+            }
+            if (capacityToSave <= 0)
+                break;
         }
+        sqlite3_finalize(stmt);
     }
+    OSSpinLockUnlock(&spinLock);
 
-    [self removeCachedResponseForCachedKeys:keysToRemove];
-    [self saveCacheInfo];
+    [self removeCachedResponseForURLs:urlsToRemove];
 }
 
 
@@ -360,10 +304,10 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     NSURLRequest *request = [context objectForKey:@"request"];
     NSCachedURLResponse *cachedResponse = [context objectForKey:@"cachedResponse"];
 
-    NSString *cacheKey = [SDURLCache cacheKeyForURL:request.URL];
+    NSURL *url = request.URL;
+    NSString *cacheKey = [SDURLCache fileNameForURL:url];
     NSString *cacheFilePath = [diskCachePath stringByAppendingPathComponent:cacheKey];
 
-    [self createDiskCachePath];
 
     // Archive the cached response on disk
     if (![NSKeyedArchiver archiveRootObject:cachedResponse toFile:cacheFilePath])
@@ -374,20 +318,32 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
     // Update disk usage info
     NSFileManager *fileManager = [[NSFileManager alloc] init];
-    NSNumber *cacheItemSize = [[fileManager attributesOfItemAtPath:cacheFilePath error:NULL] objectForKey:NSFileSize];
+    long long cacheItemSize = [[[fileManager attributesOfItemAtPath:cacheFilePath error:NULL] objectForKey:NSFileSize] longLongValue];
     [fileManager release];
-    @synchronized(self.diskCacheInfo)
-    {
-        diskCacheUsage += [cacheItemSize unsignedIntegerValue];
-        [self.diskCacheInfo setObject:[NSNumber numberWithUnsignedInteger:diskCacheUsage] forKey:kSDURLCacheInfoDiskUsageKey];
 
+    OSSpinLockLock(&spinLock);
 
-        // Update cache info for the stored item
-        [(NSMutableDictionary *)[self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey] setObject:[NSDate date] forKey:cacheKey];
-        [(NSMutableDictionary *)[self.diskCacheInfo objectForKey:kSDURLCacheInfoSizesKey] setObject:cacheItemSize forKey:cacheKey];
+    sqlite3_exec(database, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(database, "INSERT INTO cacheEntries (url, accessDate, size) VALUES (?, ?, ?);", -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, [[url absoluteString] UTF8String], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 2, [NSDate timeIntervalSinceReferenceDate]);
+        sqlite3_bind_int64(stmt, 3, cacheItemSize);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+        }
+        sqlite3_finalize(stmt);
     }
+    if (sqlite3_prepare_v2(database, "UPDATE diskUsage SET totalSize = totalSize + ?;", -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, cacheItemSize);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_exec(database, "COMMIT;", NULL, NULL, NULL);
+    
+    diskCacheUsage += cacheItemSize;
 
-    [self saveCacheInfo];
+    OSSpinLockUnlock(&spinLock);
 }
 
 - (void)periodicMaintenance
@@ -403,11 +359,6 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         self.periodicMaintenanceOperation = [[[NSInvocationOperation alloc] initWithTarget:self selector:@selector(balanceDiskUsage) object:nil] autorelease];
         [ioQueue addOperation:periodicMaintenanceOperation];
     }
-    else if (diskCacheInfoDirty)
-    {
-        self.periodicMaintenanceOperation = [[[NSInvocationOperation alloc] initWithTarget:self selector:@selector(saveCacheInfo) object:nil] autorelease];
-        [ioQueue addOperation:periodicMaintenanceOperation];
-    }
 }
 
 #pragma mark SDURLCache
@@ -415,7 +366,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 + (NSString *)defaultCachePath
 {
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
-    return [[paths objectAtIndex:0] stringByAppendingPathComponent:@"SDURLCache"];
+    return [[paths objectAtIndex:0] stringByAppendingPathComponent:@"SDURLCacheLite"];
 }
 
 #pragma mark NSURLCache
@@ -427,11 +378,48 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         self.minCacheInterval = kSDURLCacheInfoDefaultMinCacheInterval;
         self.diskCachePath = path;
 
+        NSFileManager *fileManager = [[NSFileManager alloc] init];
+        if (![fileManager fileExistsAtPath:diskCachePath])
+        {
+            [fileManager createDirectoryAtPath:diskCachePath
+                   withIntermediateDirectories:YES
+                                    attributes:nil
+                                         error:NULL];
+        }
+        [fileManager release];
+        
+        if (sqlite3_open_v2([[path stringByAppendingPathComponent:kSDURLCacheInfoFileName] UTF8String], &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, NULL) == SQLITE_OK) {
+            if (sqlite3_exec(database, "PRAGMA synchronous = 1;PRAGMA auto_vacuum = 0;VACUUM;BEGIN;CREATE TABLE IF NOT EXISTS diskUsage (totalSize INT);CREATE TABLE IF NOT EXISTS cacheEntries (url TEXT, accessDate REAL, size INT);CREATE UNIQUE INDEX IF NOT EXISTS cacheEntries_url_index ON cacheEntries (url);", NULL, NULL, NULL) == SQLITE_OK) {
+                sqlite3_stmt *stmt = NULL;
+                if (sqlite3_prepare_v2(database, "SELECT totalSize FROM diskUsage;", -1, &stmt, NULL) == SQLITE_OK) {
+                    BOOL exists = NO;
+                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                        diskCacheUsage = sqlite3_column_int64(stmt, 0);
+                        exists = YES;
+                    }
+                    sqlite3_finalize(stmt);
+                    if (!exists) {
+                        sqlite3_exec(database, "INSERT INTO diskUsage (totalSize) VALUES (0);", NULL, NULL, NULL);
+                    }
+                }
+                int error = sqlite3_exec(database, "COMMIT;", NULL, NULL, NULL);
+                if (error != SQLITE_OK) {
+                    NSLog(@"Failed with error %d", error);
+                }
+            }
+        }
+        
         // Init the operation queue
         self.ioQueue = [[[NSOperationQueue alloc] init] autorelease];
         ioQueue.maxConcurrentOperationCount = 1; // used to streamline operations in a separate thread
 
         self.ignoreMemoryOnlyStoragePolicy = YES;
+        
+        periodicMaintenanceTimer = [[NSTimer scheduledTimerWithTimeInterval:5
+                                                                     target:self
+                                                                   selector:@selector(periodicMaintenance)
+                                                                   userInfo:nil
+                                                                    repeats:YES] retain];
 	}
 
     return self;
@@ -489,50 +477,45 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     {
         return memoryResponse;
     }
+    
+    NSURL *url = request.URL;
 
-    NSString *cacheKey = [SDURLCache cacheKeyForURL:request.URL];
+    NSCachedURLResponse *diskResponse = nil;
+    @try {
+        diskResponse = [NSKeyedUnarchiver unarchiveObjectWithFile:[diskCachePath stringByAppendingPathComponent:[SDURLCache fileNameForURL:url]]];
+    }
+    @catch(id e) {
+    }
+    if (!diskResponse)
+        return nil;
 
-    // NOTE: We don't handle expiration here as even staled cache data is necessary for NSURLConnection to handle cache revalidation.
-    //       Staled cache data is also needed for cachePolicies which force the use of the cache.
-    @synchronized(self.diskCacheInfo)
-    {
-        NSMutableDictionary *accesses = [self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey];
-        if ([accesses objectForKey:cacheKey]) // OPTI: Check for cache-hit in a in-memory dictionnary before to hit the FS
-        {
-            NSCachedURLResponse *diskResponse = [NSKeyedUnarchiver unarchiveObjectWithFile:[diskCachePath stringByAppendingPathComponent:cacheKey]];
-            if (diskResponse)
-            {
-                // OPTI: Log the entry last access time for LRU cache eviction algorithm but don't save the dictionary
-                //       on disk now in order to save IO and time
-                [accesses setObject:[NSDate date] forKey:cacheKey];
-                diskCacheInfoDirty = YES;
+    OSSpinLockLock(&spinLock);
 
-                // OPTI: Store the response to memory cache for potential future requests
-                [super storeCachedResponse:diskResponse forRequest:request];
-
-                // SRK: Work around an interesting retainCount bug in CFNetwork on iOS << 3.2.
-                if (kCFCoreFoundationVersionNumber < kCFCoreFoundationVersionNumber_iPhoneOS_3_2)
-                {
-                    diskResponse = [super cachedResponseForRequest:request];
-                }
-
-                if (diskResponse)
-                {
-                    return diskResponse;
-                }
-            }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(database, "UPDATE cacheEntries SET accessDate = ? WHERE url = ?;", -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_double(stmt, 1, [NSDate timeIntervalSinceReferenceDate]);
+        sqlite3_bind_text(stmt, 2, [[url absoluteString] UTF8String], -1, NULL);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
         }
+        sqlite3_finalize(stmt);
     }
 
-    return nil;
+    OSSpinLockUnlock(&spinLock);
+    
+    // OPTI: Store the response to memory cache for potential future requests
+    [super storeCachedResponse:diskResponse forRequest:request];
+    
+    // SRK: Work around an interesting retainCount bug in CFNetwork on iOS << 3.2.
+    if (kCFCoreFoundationVersionNumber < kCFCoreFoundationVersionNumber_iPhoneOS_3_2)
+    {
+        diskResponse = [super cachedResponseForRequest:request];
+    }
+    
+    return diskResponse;
 }
 
 - (NSUInteger)currentDiskUsage
 {
-    if (!diskCacheInfo)
-    {
-        [self diskCacheInfo];
-    }
     return diskCacheUsage;
 }
 
@@ -541,19 +524,29 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     request = [SDURLCache canonicalRequestForRequest:request];
 
     [super removeCachedResponseForRequest:request];
-    [self removeCachedResponseForCachedKeys:[NSArray arrayWithObject:[SDURLCache cacheKeyForURL:request.URL]]];
-    [self saveCacheInfo];
+    [self removeCachedResponseForURLs:[NSArray arrayWithObject:request.URL]];
 }
 
 - (void)removeAllCachedResponses
 {
     [super removeAllCachedResponses];
-    NSFileManager *fileManager = [[[NSFileManager alloc] init] autorelease];
-    [fileManager removeItemAtPath:diskCachePath error:NULL];
-    @synchronized(self)
-    {
-        [diskCacheInfo release], diskCacheInfo = nil;
+    NSFileManager *fileManager = [[NSFileManager alloc] init];
+    OSSpinLockLock(&spinLock);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(database, "SELECT url FROM cacheEntries;", -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            NSURL *url = [NSURL URLWithString:[NSString stringWithUTF8String:(const char *)sqlite3_column_text(stmt, 0)]];
+            NSString *filePath = [diskCachePath stringByAppendingPathComponent:[SDURLCache fileNameForURL:url]];
+            [fileManager removeItemAtPath:filePath error:NULL];
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_exec(database, "BEGIN;UPDATE diskUsage SET totalSize = 0;DELETE FROM cacheEntries;COMMIT;", NULL, NULL, NULL);
+        diskCacheUsage = 0;
     }
+
+    OSSpinLockUnlock(&spinLock);
+    [fileManager release];
 }
 
 - (BOOL)isCached:(NSURL *)url
@@ -565,7 +558,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     {
         return YES;
     }
-    NSString *cacheKey = [SDURLCache cacheKeyForURL:url];
+    NSString *cacheKey = [SDURLCache fileNameForURL:url];
     NSString *cacheFile = [diskCachePath stringByAppendingPathComponent:cacheKey];
     if ([[[[NSFileManager alloc] init] autorelease] fileExistsAtPath:cacheFile])
     {
@@ -581,8 +574,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     [periodicMaintenanceTimer invalidate];
     [periodicMaintenanceTimer release], periodicMaintenanceTimer = nil;
     [periodicMaintenanceOperation release], periodicMaintenanceOperation = nil;
-    [diskCachePath release], diskCachePath = nil;
-    [diskCacheInfo release], diskCacheInfo = nil;
+    sqlite3_close(database);
     [ioQueue release], ioQueue = nil;
     [super dealloc];
 }
