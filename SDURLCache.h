@@ -16,7 +16,6 @@
     NSString *diskCachePath;
     sqlite3 *database;
     volatile OSSpinLock spinLock;
-    NSMutableDictionary *diskCacheInfo;
     BOOL ignoreMemoryOnlyStoragePolicy;
     sqlite3_int64 diskCacheUsage;
     NSTimeInterval minCacheInterval;
