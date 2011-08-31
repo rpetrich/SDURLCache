@@ -281,7 +281,9 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     OSSpinLockLock(&spinLock);
     sqlite3_stmt *stmt = NULL;
     sqlite3_int64 capacityToSave = diskCacheUsage - self.diskCapacity;
-    if (sqlite3_prepare_v2(database, "SELECT url, size FROM cacheEntries ORDER BY accessData;", -1, &stmt, NULL) != SQLITE_OK) {
+    // Attempt deleting expired URLs first
+    if (sqlite3_prepare_v2(database, "SELECT url, size FROM cacheEntries WHERE expirationDate < ?;", -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_bind_double(stmt, 1, [NSDate timeIntervalSinceReferenceDate]);
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             const void *urlString = sqlite3_column_text(stmt, 0);
             if (urlString) {
@@ -292,6 +294,21 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
                 break;
         }
         sqlite3_finalize(stmt);
+    }
+    if (capacityToSave > 0) {
+        // If we still need space, continue evicting oldest accessed URLs
+        if (sqlite3_prepare_v2(database, "SELECT url, size FROM cacheEntries ORDER BY accessDate;", -1, &stmt, NULL) != SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const void *urlString = sqlite3_column_text(stmt, 0);
+                if (urlString) {
+                    [urlsToRemove addObject:[NSURL URLWithString:[NSString stringWithUTF8String:urlString]]];
+                    capacityToSave -= sqlite3_column_int64(stmt, 1);
+                }
+                if (capacityToSave <= 0)
+                    break;
+            }
+            sqlite3_finalize(stmt);
+        }
     }
     OSSpinLockUnlock(&spinLock);
 
@@ -321,14 +338,28 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     long long cacheItemSize = [[[fileManager attributesOfItemAtPath:cacheFilePath error:NULL] objectForKey:NSFileSize] longLongValue];
     [fileManager release];
 
+    // Calculate expiration data
+    NSTimeInterval expirationDate = DBL_MAX;
+    if ([cachedResponse.response isKindOfClass:[NSHTTPURLResponse self]]) {
+        NSDictionary *headers = [(NSHTTPURLResponse *)cachedResponse.response allHeaderFields];
+        // RFC 2616 section 13.3.4 says clients MUST use Etag in any cache-conditional request if provided by server
+        if (![headers objectForKey:@"Etag"]) {
+            NSDate *expires = [SDURLCache expirationDateFromHeaders:headers withStatusCode:((NSHTTPURLResponse *)cachedResponse.response).statusCode];
+            if (expires) {
+                expirationDate = [expires timeIntervalSinceReferenceDate];
+            }
+        }
+    }
+        
     OSSpinLockLock(&spinLock);
 
     sqlite3_exec(database, "BEGIN;", NULL, NULL, NULL);
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(database, "INSERT INTO cacheEntries (url, accessDate, size) VALUES (?, ?, ?);", -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(database, "INSERT INTO cacheEntries (url, accessDate, expirationDate, size) VALUES (?, ?, ?);", -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, [[url absoluteString] UTF8String], -1, SQLITE_TRANSIENT);
         sqlite3_bind_double(stmt, 2, [NSDate timeIntervalSinceReferenceDate]);
-        sqlite3_bind_int64(stmt, 3, cacheItemSize);
+        sqlite3_bind_double(stmt, 3, expirationDate);
+        sqlite3_bind_int64(stmt, 4, cacheItemSize);
         while (sqlite3_step(stmt) == SQLITE_ROW) {
         }
         sqlite3_finalize(stmt);
@@ -389,7 +420,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         [fileManager release];
         
         if (sqlite3_open_v2([[path stringByAppendingPathComponent:kSDURLCacheInfoFileName] UTF8String], &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, NULL) == SQLITE_OK) {
-            if (sqlite3_exec(database, "PRAGMA synchronous = 1;PRAGMA auto_vacuum = 0;VACUUM;BEGIN;CREATE TABLE IF NOT EXISTS diskUsage (totalSize INT);CREATE TABLE IF NOT EXISTS cacheEntries (url TEXT, accessDate REAL, size INT);CREATE UNIQUE INDEX IF NOT EXISTS cacheEntries_url_index ON cacheEntries (url);", NULL, NULL, NULL) == SQLITE_OK) {
+            if (sqlite3_exec(database, "PRAGMA synchronous = 1;PRAGMA auto_vacuum = 0;VACUUM;BEGIN;CREATE TABLE IF NOT EXISTS diskUsage (totalSize INT);CREATE TABLE IF NOT EXISTS cacheEntries (url TEXT, accessDate REAL, expirationDate REAL, size INT);CREATE UNIQUE INDEX IF NOT EXISTS cacheEntries_url_index ON cacheEntries (url);", NULL, NULL, NULL) == SQLITE_OK) {
                 sqlite3_stmt *stmt = NULL;
                 if (sqlite3_prepare_v2(database, "SELECT totalSize FROM diskUsage;", -1, &stmt, NULL) == SQLITE_OK) {
                     BOOL exists = NO;
