@@ -58,6 +58,12 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
 @synthesize diskCachePath, minCacheInterval, ioQueue, periodicMaintenanceOperation, ignoreMemoryOnlyStoragePolicy;
 
++ (SDURLCache *)sharedDiskURLCache
+{
+    id result = [super sharedURLCache];
+    return [result isKindOfClass:self] ? result : nil;
+}
+
 #pragma mark SDURLCache (tools)
 
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request
@@ -325,7 +331,6 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     NSString *cacheKey = [SDURLCache fileNameForURL:url];
     NSString *cacheFilePath = [diskCachePath stringByAppendingPathComponent:cacheKey];
 
-
     // Archive the cached response on disk
     if (![NSKeyedArchiver archiveRootObject:cachedResponse toFile:cacheFilePath])
     {
@@ -352,6 +357,12 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     }
         
     OSSpinLockLock(&spinLock);
+    
+    NSDate *pendingDate = [pendingForcedExpirationDates objectForKey:url];
+    if (pendingDate) {
+        expirationDate = [pendingDate timeIntervalSinceReferenceDate];
+        [pendingForcedExpirationDates removeObjectForKey:url];
+    }
 
     sqlite3_exec(database, "BEGIN;", NULL, NULL, NULL);
     sqlite3_stmt *stmt = NULL;
@@ -470,23 +481,40 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         return;
     }
 
+    OSSpinLockLock(&spinLock);
+    NSDate *pendingDate = [pendingForcedExpirationDates objectForKey:request.URL];
+    OSSpinLockUnlock(&spinLock);
+    if (pendingDate) {
+        // Convert cached response to use a vanilla NSURLResponse so that there's no Date/Etag (and we cannot create an NSHTTPURLResponse)
+        NSURLResponse *oldResponse = [cachedResponse response];
+        NSURLResponse *newResponse = [[NSURLResponse alloc] initWithURL:[oldResponse URL]
+                                                               MIMEType:[oldResponse MIMEType]
+                                                  expectedContentLength:(NSInteger /* inconsistent type definitions in header */)[oldResponse expectedContentLength]
+                                                       textEncodingName:[oldResponse textEncodingName]];
+        cachedResponse = [[[NSCachedURLResponse alloc] initWithResponse:newResponse data:[cachedResponse data] userInfo:[cachedResponse userInfo] storagePolicy:[cachedResponse storagePolicy]] autorelease];
+        [newResponse release];
+    }
+    
     [super storeCachedResponse:cachedResponse forRequest:request];
 
+    BOOL isHTTP = [cachedResponse.response isKindOfClass:[NSHTTPURLResponse self]];
     NSURLCacheStoragePolicy storagePolicy = cachedResponse.storagePolicy;
     if ((storagePolicy == NSURLCacheStorageAllowed || (storagePolicy == NSURLCacheStorageAllowedInMemoryOnly && ignoreMemoryOnlyStoragePolicy))
-        && [cachedResponse.response isKindOfClass:[NSHTTPURLResponse self]]
+        && (isHTTP || pendingDate)
         && cachedResponse.data.length < self.diskCapacity)
     {
-        NSDictionary *headers = [(NSHTTPURLResponse *)cachedResponse.response allHeaderFields];
-        // RFC 2616 section 13.3.4 says clients MUST use Etag in any cache-conditional request if provided by server
-        if (![headers objectForKey:@"Etag"])
-        {
-            NSDate *expirationDate = [SDURLCache expirationDateFromHeaders:headers
-                                                            withStatusCode:((NSHTTPURLResponse *)cachedResponse.response).statusCode];
-            if (!expirationDate || [expirationDate timeIntervalSinceNow] - minCacheInterval <= 0)
+        if (isHTTP) {
+            NSDictionary *headers = [(NSHTTPURLResponse *)cachedResponse.response allHeaderFields];
+            // RFC 2616 section 13.3.4 says clients MUST use Etag in any cache-conditional request if provided by server
+            if (![headers objectForKey:@"Etag"])
             {
-                // This response is not cacheable, headers said
-                return;
+                NSDate *expirationDate = [SDURLCache expirationDateFromHeaders:headers
+                                                                withStatusCode:((NSHTTPURLResponse *)cachedResponse.response).statusCode];
+                if (!expirationDate || [expirationDate timeIntervalSinceNow] - minCacheInterval <= 0)
+                {
+                    // This response is not cacheable, headers said
+                    return;
+                }
             }
         }
 
@@ -547,7 +575,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
 - (NSUInteger)currentDiskUsage
 {
-    return diskCacheUsage;
+    return (NSUInteger)diskCacheUsage;
 }
 
 - (void)removeCachedResponseForRequest:(NSURLRequest *)request
@@ -596,6 +624,58 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         return YES;
     }
     return NO;
+}
+
+- (NSDate *)expirationDateForURL:(NSURL *)url
+{
+    NSDate *result = nil;
+
+    // Retrieve from database
+    OSSpinLockLock(&spinLock);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(database, "SELECT expirationDate FROM cacheEntries WHERE url = ?;", -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, [[url absoluteString] UTF8String], -1, NULL);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            result = [NSDate dateWithTimeIntervalSinceReferenceDate:sqlite3_column_double(stmt, 0)];
+        }
+        sqlite3_finalize(stmt);
+    }
+    OSSpinLockUnlock(&spinLock);
+    
+    // Fallback to in-memory expiration date
+    if (!result) {
+        NSURLRequest *request = [NSURLRequest requestWithURL:url];
+        request = [SDURLCache canonicalRequestForRequest:request];
+        
+        NSURLResponse *cachedResponse = [super cachedResponseForRequest:request].response;
+        if ([cachedResponse isKindOfClass:[NSHTTPURLResponse class]]) {
+            NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)cachedResponse;
+            result = [SDURLCache expirationDateFromHeaders:[httpResponse allHeaderFields] withStatusCode:[httpResponse statusCode]];
+        }
+    }
+
+    return result;
+}
+
+- (void)forceExpirationDate:(NSDate *)date forURL:(NSURL *)url
+{
+    OSSpinLockLock(&spinLock);
+    if (date) {
+        if (!pendingForcedExpirationDates)
+            pendingForcedExpirationDates = [NSMutableDictionary dictionary];
+        [pendingForcedExpirationDates setObject:date forKey:url];
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(database, "UPDATE cacheEntries SET expirationDate = ? WHERE url = ?;", -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_double(stmt, 1, [date timeIntervalSinceReferenceDate]);
+            sqlite3_bind_text(stmt, 2, [[url absoluteString] UTF8String], -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+            }
+            sqlite3_finalize(stmt);
+        }
+    } else {
+        [pendingForcedExpirationDates removeObjectForKey:url];
+    }
+    OSSpinLockUnlock(&spinLock);
 }
 
 #pragma mark NSObject

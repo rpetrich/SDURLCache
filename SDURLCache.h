@@ -22,7 +22,10 @@
     NSOperationQueue *ioQueue;
     NSTimer *periodicMaintenanceTimer;
     NSOperation *periodicMaintenanceOperation;
+    NSMutableDictionary *pendingForcedExpirationDates;
 }
+
++ (SDURLCache *)sharedDiskURLCache;
 
 /*
  * Defines the minimum number of seconds between now and the expiration time of a cacheable response
@@ -52,5 +55,15 @@
  * Checks if the provided URL exists in cache.
  */
 - (BOOL)isCached:(NSURL *)url;
+
+/*
+ * Checks the expiration date of a URL that exists in cache.
+ */
+- (NSDate *)expirationDateForURL:(NSURL *)url;
+
+/*
+ * Forces a particular expiration date for a URL that exists in cache or will be loaded shortly.
+ */
+- (void)forceExpirationDate:(NSDate *)date forURL:(NSURL *)url;
 
 @end
